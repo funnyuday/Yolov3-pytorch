@@ -1,22 +1,11 @@
-from __future__ import division
-from itertools import chain
 import os
-
+import pdb
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-
-from utils.yolo_utils import parse_model_config
-
-
-def weights_init_normal(m):
-    classname = m.__class__.__name__
-    if classname.find("Conv") != -1:
-        nn.init.normal_(m.weight.data, 0.0, 0.02)
-    elif classname.find("BatchNorm2d") != -1:
-        nn.init.normal_(m.weight.data, 1.0, 0.02)
-        nn.init.constant_(m.bias.data, 0.0)
+from torchvision.utils import save_image as save_tensor
+from .utils import fn_timer
 
 def create_modules(module_defs):
     """
@@ -93,14 +82,18 @@ def create_modules(module_defs):
             modules.add_module(f"shortcut_{module_i}", nn.Sequential())
 
         elif module_def["type"] == "yolo":
+            labels_mask = None
             anchor_idxs = [int(x) for x in module_def["mask"].split(",")]
             # Extract anchors
             anchors = [int(x) for x in module_def["anchors"].split(",")]
             anchors = [(anchors[i], anchors[i + 1]) for i in range(0, len(anchors), 2)]
-            anchors = [anchors[i] for i in anchor_idxs]
+            strides = int(module_def["strides"])
+            ignore_thresh = float(module_def["ignore_thresh"])
             num_classes = int(module_def["classes"])
+            if "labels" in module_def:
+                labels_mask = [int(x) for x in module_def["labels"].split(",")]
             # Define detection layer
-            yolo_layer = YOLOLayer(anchors, num_classes)
+            yolo_layer = YOLOLayer([anchors, anchor_idxs], num_classes, strides, ignore_thresh)
             modules.add_module(f"yolo_{module_i}", yolo_layer)
         # Register module list and number of output filters
         module_list.append(modules)
@@ -108,6 +101,72 @@ def create_modules(module_defs):
 
     return hyperparams, module_list
 
+def bboxes_iou(bboxes_a, bboxes_b, xyxy=True, GIoU=False):
+    if bboxes_a.shape[1] != 4 or bboxes_b.shape[1] != 4:
+        raise IndexError
+    if xyxy:
+        tl = torch.max(bboxes_a[:, None, :2], bboxes_b[:, :2])
+        br = torch.min(bboxes_a[:, None, 2:], bboxes_b[:, 2:])
+        area_a = torch.prod(bboxes_a[:, 2:] - bboxes_a[:, :2], 1)
+        area_b = torch.prod(bboxes_b[:, 2:] - bboxes_b[:, :2], 1)
+        a_x1, a_y1, a_x2, a_y2 = bboxes_a[:, None, 0], bboxes_a[:, None, 1], bboxes_a[:, None, 2], bboxes_a[:, None, 3]
+        b_x1, b_y1, b_x2, b_y2 = bboxes_b[:, 0], bboxes_b[:, 1], bboxes_b[:, 2], bboxes_b[:, 3]
+    else:
+        tl = torch.max((bboxes_a[:, None, :2] - bboxes_a[:, None, 2:] / 2),
+                       (bboxes_b[:, :2] - bboxes_b[:, 2:] / 2))
+        br = torch.min((bboxes_a[:, None, :2] + bboxes_a[:, None, 2:] / 2),
+                       (bboxes_b[:, :2] + bboxes_b[:, 2:] / 2))
+        area_a = torch.prod(bboxes_a[:, 2:], 1)
+        area_b = torch.prod(bboxes_b[:, 2:], 1)
+        a_x1, a_y1, a_x2, a_y2 = (bboxes_a[:, None, 0] - bboxes_a[:, None, 2] / 2), \
+                                 (bboxes_a[:, None, 1] - bboxes_a[:, None, 2] / 3), \
+                                 (bboxes_a[:, None, 0] + bboxes_a[:, None, 2] / 2), \
+                                 (bboxes_a[:, None, 1] + bboxes_a[:, None, 2] / 3)
+        b_x1, b_y1, b_x2, b_y2 = (bboxes_b[:, 0] - bboxes_b[:, 2] / 2), \
+                                 (bboxes_b[:, 1] - bboxes_b[:, 3] / 2), \
+                                 (bboxes_b[:, 0] + bboxes_b[:, 2] / 2), \
+                                 (bboxes_b[:, 1] + bboxes_b[:, 3] / 2)
+    en = (tl < br).type(tl.type()).prod(dim=2)
+    area_i = torch.prod(br - tl, 2) * en
+    union = (area_a[:, None] + area_b - area_i)
+    iou = area_i / union
+    if GIoU:
+        cw = torch.max(a_x2, b_x2) - torch.min(a_x1, b_x1)
+        ch = torch.max(a_y2, b_y2) - torch.min(a_y1, b_y1)
+        c_area = cw * ch + 1e-6
+        return iou - (c_area - union) / c_area
+    return iou
+
+def wh_iou(wh1, wh2, GIoU=False):
+    wh1 = wh1[:, None]
+    wh2 = wh2[None]
+    inter = torch.min(wh1, wh2).prod(2)
+    union = (wh1.prod(2) + wh2.prod(2) - inter)
+    iou = inter / union
+    if GIoU:
+        c_area = torch.max(wh1, wh2).prod(2)
+        return iou - (c_area - union) / c_area
+    return iou
+
+def parse_model_config(path):
+    """Parses the yolo-v3 layer configuration file and returns module definitions"""
+    file = open(path, 'r')
+    lines = file.read().split('\n')
+    lines = [x for x in lines if x and not x.startswith('#')]
+    lines = [x.rstrip().lstrip() for x in lines]  # get rid of fringe whitespaces
+    module_defs = []
+    for line in lines:
+        if line.startswith('['):  # This marks the start of a new block
+            module_defs.append({})
+            module_defs[-1]['type'] = line[1:-1].rstrip()
+            if module_defs[-1]['type'] == 'convolutional':
+                module_defs[-1]['batch_normalize'] = 0
+        else:
+            key, value = line.split("=")
+            value = value.strip()
+            module_defs[-1][key.rstrip()] = value.strip()
+
+    return module_defs
 
 class Upsample(nn.Module):
     """ nn.Upsample is deprecated """
@@ -131,10 +190,25 @@ class Mish(nn.Module):
     def forward(self, x):
         return x * torch.tanh(F.softplus(x))
 
+class BCEFcoalloss(nn.Module):
+    def __init__(self, gamma=2, alpha=0.25, reduction='mean'):
+        super(BCEFcoalloss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+    
+    def forward(self, pt, target):
+        pt = pt + 1e-6
+        loss = -self.alpha*(1 - pt)**self.gamma*target*torch.log(pt) - \
+               (1 - self.alpha)*pt**self.gamma*(1 - target)*torch.log(1 - pt)
+        if self.reduction == 'mean':
+            loss = torch.mean(loss)
+        elif self.reduction == 'sum':
+            loss = torch.sum(loss)
+        return loss
 
 class YOLOLayer(nn.Module):
     """Detection layer"""
-
     def __init__(self, anchors, num_classes, stride, ignore_thr):
         super(YOLOLayer, self).__init__()
         self.anchors = anchors[0]
@@ -143,6 +217,7 @@ class YOLOLayer(nn.Module):
         self.n_classes = num_classes
         self.ignore_thr = ignore_thr
         self.mse_loss = nn.MSELoss(reduction='sum')
+        self.bce_focalloss = BCEFcoalloss(reduction='sum')
         self.stride = stride
         self.all_anchors_grid = [(w / self.stride, h / self.stride) for w, h in self.anchors]
         self.all_mask_anchors = [self.all_anchors_grid[i] for i in self.anchors_mask]
@@ -150,78 +225,140 @@ class YOLOLayer(nn.Module):
         self.ref_anchors[:, 2:] = np.array(self.all_anchors_grid)
         self.ref_anchors = torch.FloatTensor(self.ref_anchors)
 
-    def forward(self, x, label=None, path=None):
+    def forward(self, x, labels=None, path=None):
         out = x
         bs = out.shape[0]
-        fs = out.shape[2]
-        nc = 5 +self.n_classes
-        dtype = torch.cuda.FloatTensor() if  x.is_cuda else torch.FloatTensor()
-        out = out.view(bs, self.n_anchors, nc, fs, fs)
+        fs_x = out.shape[3]
+        fs_y = out.shape[2]
+        nc = 5 + self.n_classes
+        dtype = torch.cuda.FloatTensor if  x.is_cuda else torch.FloatTensor
+
+        out = out.view(bs, self.n_anchors, nc, fs_y, fs_x)
         out = out.permute(0, 1, 3, 4, 2).contiguous()
         # logistic activation for xy, obj, cls
         out[..., np.r_[:2, 4:nc]] = torch.sigmoid(out[..., np.r_[:2, 4:nc]])
-        x_shift = dtype(np.broadcast_to(torch.arange(fs), out.shape[:4]))
-        y_shift = dtype(np.broadcast_to(torch.arange(fs).reshape(fs, 1), out.shape[:1]))
+        x_shift = dtype(np.broadcast_to(torch.arange(fs_x), out.shape[:4])).cuda(x.device)
+        y_shift = dtype(np.broadcast_to(torch.arange(fs_y).reshape(fs_y, 1), out.shape[:4])).cuda(x.device)
         masked_anchors = np.array(self.all_mask_anchors)
         w_anchors = dtype(np.broadcast_to(np.reshape(
-            masked_anchors[:, 0], (1, self.n_anchors, 1, 1)), out.shape[:4]))
+            masked_anchors[:, 0], (1, self.n_anchors, 1, 1)), out.shape[:4])).cuda(x.device)
         h_anchors = dtype(np.broadcast_to(np.reshape(
-            masked_anchors[:, 1], (1, self.n_anchors, 1, 1)), out.shape[:4]))
+            masked_anchors[:, 1], (1, self.n_anchors, 1, 1)), out.shape[:4])).cuda(x.device)
 
         pred = out.clone()
-        pred[..., 0] = (pred[..., 0] + x_shift) / fs
-        pred[..., 1] = (pred[..., 1] + y_shift) / fs
-        pred[..., 2] = torch.exp(pred[..., 2]) * w_anchors / fs
-        pred[..., 3] = torch.exp(pred[..., 3]) * w_anchors / fs
+        pred[..., 0] = (pred[..., 0] + x_shift) / fs_x
+        pred[..., 1] = (pred[..., 1] + y_shift) / fs_y
+        pred[..., 2] = torch.exp(pred[..., 2]) * w_anchors / fs_x
+        pred[..., 3] = torch.exp(pred[..., 3]) * h_anchors / fs_y
 
+        pred_box = pred.clone()
+        pred_box[..., [0, 2]] *= self.stride*fs_x
+        pred_box[..., [1, 3]] *= self.stride*fs_y
+        pred_box = pred_box.view(bs, -1, nc).data
         if not self.training:
-            pred[..., :4] = (pred[..., :4] * self.stride *fs)
-            return None, None, pred.view(bs, -1, nc).data
+            return None, None, pred_box
 
         pred = pred[..., :4].data
         # target assignment
-        cls_mask = torch.zeros(bs, self.n_anchors, fs, fs, 4 + self.n_classes).type(dtype)
-        obj_mask = torch.zeros(bs, self.n_anchors, fs, fs).type(dtype)
-        scale = torch.zeros(bs, self.n_anchors, fs, fs, 4).type(dtype)
-        target = torch.zeros(bs, self.n_anchors, fs, fs, nc).type(dtype)
+        cls_mask = torch.zeros(bs, self.n_anchors, 
+                               fs_y, fs_x, 4 + self.n_classes).type(dtype).cuda(x.device)
+        obj_mask = torch.ones(bs, self.n_anchors, 
+                              fs_y, fs_x).type(dtype).cuda(x.device)
+        scale = torch.zeros(bs, self.n_anchors,
+                            fs_y, fs_x, 4).type(dtype).cuda(x.device)
+        target = torch.zeros(bs, self.n_anchors,
+                             fs_y, fs_x, nc).type(dtype).cuda(x.device)
 
-        gt_x, gt_y, gt_w, gt_h = label[:, 2], label[:, 3], label[:, 4], label[:, 5]
-        gi = (gt_x * fs).long()
-        gj = (gt_y * fs).long()
-        gi[gi >= fs] = fs -1
-        gi[gj >= fs] = fs - 1
+        gt_x, gt_y, gt_w, gt_h = labels[:, 2], labels[:, 3], labels[:, 4], labels[:, 5]
+        gi = (gt_x * fs_x).long()
+        gj = (gt_y * fs_y).long()
+        gi[gi >= fs_x] = fs_x - 1
+        gj[gj >= fs_y] = fs_y - 1
 
-        gt_box = dtype(np.zeros((len(label), 4)))
-        gt_box[: 0], gt_box[: 1], gt_box[: 2], gt_box[: 3] = gt_x, gt_y, gt_w, gt_h
+        gt_box = dtype(np.zeros((len(labels), 4))).cuda(x.device)
+        gt_box[:, 0], gt_box[:, 1], gt_box[:, 2], gt_box[:, 3] = gt_x, gt_y, gt_w, gt_h
 
-        for b in range(bs):
-            cur = label[:0] == b
-            n = len(label[cur])
+        # calculate iou between truth and reference anchors
+        anchor_ious_all = wh_iou(gt_box[..., 2:].cpu(), torch.stack([self.ref_anchors[..., 2] / fs_x, self.ref_anchors[..., 3] / fs_y], dim=1), GIoU=True)
+        best_iou, best_n_all = anchor_ious_all.max(dim=1)
+        best_n = best_n_all % len(self.anchors_mask)
+        best_n_mask = ((best_n_all == self.anchors_mask[0]) | (best_n_all == self.anchors_mask[1]) | (best_n_all == self.anchors_mask[2]) | (best_n_all == self.anchors_mask[3])) # | (best_iou > 0.7)
+
+        ti = best_n_mask == 1
+        b, a, j, i = labels[:, 0][ti].long(), best_n[ti], gj[ti], gi[ti]
+
+        # make sure one anchor match one label
+        pos = torch.stack([b, a.cuda(x.device), j, i]).T
+        p_mask = torch.ones_like(b).bool()
+        for p in range(len(pos)):
+            p_mask_tmp = (pos == pos[p]).sum(1) == 4
+            if p_mask_tmp.sum() <= 1: continue
+            p_mask_tmp[p] = False
+            pos[p] = dtype([99, 99, 99, 99])
+            p_mask = p_mask & ~p_mask_tmp
+
+        b, a, j, i = b[p_mask], a[p_mask], j[p_mask], i[p_mask]
+        for ba in range(bs):
+            cur = labels[:, 0] == ba
+            n = len(labels[cur])
             if n == 0: continue
-            pred_ious = bboxes_iou(pred[b].view(-1, 4), gt_box[cur], xyxy=False)
-            pred_best_iou = pred_ious.max(dim=1)
-            pred_best_iou = pred_best_iou[pred_best_iou > self.ignore_thr].view(pred[b].shape[:0])
+            pred_ious = bboxes_iou(pred[ba].view(-1, 4), gt_box[cur], xyxy=False)
+            pred_best_iou, _ = pred_ious.max(dim=1)
+            pred_best_iou = (pred_best_iou > self.ignore_thr)
+            pred_best_iou = pred_best_iou.view(pred[ba].shape[:3])
             # set mask to zero (ignore) if pred matches truth
-            obj_mask[b] = ~pred_best_iou
+            obj_mask[ba] = ~pred_best_iou
 
-        return x
+        obj_mask[b, a, j, i] = 1
+        cls_mask[b, a, j, i, :] = 1
+        target[b, a, j, i, 0] = gt_x[ti][p_mask] * fs_x - i
+        target[b, a, j, i, 1] = gt_y[ti][p_mask] * fs_y - j
+        target[b, a, j, i, 2] = torch.log(gt_w[ti][p_mask] * self.stride * fs_x / (dtype(self.all_mask_anchors)[a][..., 0] * self.stride).cuda(x.device))
+        target[b, a, j, i, 3] = torch.log(gt_h[ti][p_mask] * self.stride * fs_y / (dtype(self.all_mask_anchors)[a][..., 1] * self.stride).cuda(x.device))
+        target[b, a, j, i, 4] = 1
+        target[b, a, j, i, 5 + labels[:, 1][ti][p_mask].long()] = 1
+        scale[b, a, j, i, :] = scale[b, a, j, i, :].copy_(torch.unsqueeze(2 - gt_w[ti][p_mask] * gt_h[ti][p_mask], 1))
 
+        out[..., 4] *= obj_mask
+        out[..., np.r_[0:4, 5:nc]] *= cls_mask
+        out[..., :4] *= scale
+
+        target[..., 4] *= obj_mask
+        target[..., np.r_[0:4, 5:nc]] *= cls_mask
+        target[..., :4] *= scale
+
+        loss_xy = self.mse_loss(out[..., :2], target[..., :2])
+        loss_wh = self.mse_loss(out[..., 2:4], target[..., 2:4])
+        loss_obj = self.mse_loss(out[..., 4], target[..., 4])
+        loss_cls = self.mse_loss(out[..., 5:], target[..., 5:])
+        loss = loss_xy + loss_wh + loss_cls + loss_obj
+        return loss, torch.stack((loss_xy, loss_wh, loss_obj, loss_cls, loss)).detach(), pred_box
 
 class Darknet(nn.Module):
     """YOLOv3 object detection model"""
-
-    def __init__(self, config_path):
+    def __init__(self, opt):
         super(Darknet, self).__init__()
-        self.module_defs = parse_model_config(config_path)
+        self.opt = opt
+        self.module_defs = parse_model_config(opt.cfg)
         self.hyperparams, self.module_list = create_modules(self.module_defs)
-        self.yolo_layers = [layer[0]
-                            for layer in self.module_list if isinstance(layer[0], YOLOLayer)]
+        self.yolo_layers = [layer[0] for layer in self.module_list if isinstance(layer[0], YOLOLayer)]
         self.seen = 0
         self.header_info = np.array([0, 0, 0, self.seen, 0], dtype=np.int32)
 
-    def forward(self, x):
-        img_size = x.size(2)
-        layer_outputs, yolo_outputs = [], []
+    def weights_init_normal(self, m):
+        classname = m.__class__.__name__
+        if classname.find("Conv") != -1:
+            nn.init.normal_(m.weight.data, 0.0, 0.02)
+        elif classname.find("BatchNorm2d") != -1:
+            nn.init.normal_(m.weight.data, 1.0, 0.02)
+            nn.init.constant_(m.bias.data, 0.0)
+
+    def forward(self, x, labels=None, path=None):
+        dtype = (torch.cuda.FloatTensor if x.is_cuda else torch.FloatTensor)
+        layer_outputs, yolo_outputs, loss, loss_l = [], [], dtype([0]).cuda(x.device), dtype([0,0,0,0,0]).cuda(x.device)
+        if labels != None:
+            if len(labels) == 0:
+                return loss, loss_l
         for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
             if module_def["type"] in ["convolutional", "upsample", "maxpool"]:
                 x = module(x)
@@ -234,10 +371,14 @@ class Darknet(nn.Module):
                 layer_i = int(module_def["from"])
                 x = layer_outputs[-1] + layer_outputs[layer_i]
             elif module_def["type"] == "yolo":
-                x = module[0](x, img_size)
+                layer_loss, layer_loss_l, x = module[0](x, labels, path)
+                yolo_outputs.append(x)
+                if layer_loss is not None:
+                    loss += layer_loss
+                    loss_l += layer_loss_l
                 yolo_outputs.append(x)
             layer_outputs.append(x)
-        return yolo_outputs if self.training else torch.cat(yolo_outputs, 1)
+        return loss/x.shape[0], (loss_l / len(yolo_outputs) / x.shape[0]) if self.opt.mode == "Train" else torch.cat(yolo_outputs, 1)
 
     def load_darknet_weights(self, weights_path):
         """Parses and loads the weights stored in 'weights_path'"""
@@ -330,32 +471,4 @@ class Darknet(nn.Module):
                     conv_layer.bias.data.cpu().numpy().tofile(fp)
                 # Load conv weights
                 conv_layer.weight.data.cpu().numpy().tofile(fp)
-
         fp.close()
-
-
-def load_model(model_path, weights_path=None):
-    """Loads the yolo model from file.
-
-    :param model_path: Path to model definition file (.cfg)
-    :type model_path: str
-    :param weights_path: Path to weights or checkpoint file (.weights or .pth)
-    :type weights_path: str
-    :return: Returns model
-    :rtype: Darknet
-    """
-    device = torch.device("cuda" if torch.cuda.is_available()
-                          else "cpu")  # Select device for inference
-    model = Darknet(model_path).to(device)
-
-    model.apply(weights_init_normal)
-
-    # If pretrained weights are specified, start from checkpoint or weight file
-    if weights_path:
-        if weights_path.endswith(".pth"):
-            # Load checkpoint weights
-            model.load_state_dict(torch.load(weights_path, map_location=device))
-        else:
-            # Load darknet weights
-            model.load_darknet_weights(weights_path)
-    return model

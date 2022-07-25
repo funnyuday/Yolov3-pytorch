@@ -1,7 +1,6 @@
-from cProfile import label
 import os
 import cv2
-import ipdb
+import pdb
 import math
 import copy
 import torch
@@ -9,12 +8,19 @@ import random
 import warnings
 import numpy as np
 import torch.utils.data as data
+
 from tqdm import tqdm
 from PIL import ImageFile
 from torchvision import transforms
-from utils import xywh2xyxy, xyxy2xywh, xywhn2xyxy
-
+from model.yolo.utils import xywh2xyxy, xyxy2xywh, xywhn2xyxy
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+def rand_scale(s):
+    scale = random.uniform(1, s)
+    if random.uniform(0, 1) < 0.5:
+        return scale
+    else:
+        return 1./scale
 
 def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1, eps=1e-16):
     # Compute candidate boxes: box1 before augment, box2 after augment, wh_thr (pixels), aspect_ratio_thr, area_ratio
@@ -94,7 +100,7 @@ def random_crop(img, labels):
     h, w = img.shape[:2]
     size_w = int(w * scale)
     size_h = int(h * scale)
-    x = np.random.randint(0, h - size_w)
+    x = np.random.randint(0, w - size_w)
     y = np.random.randint(0, h - size_h)
     crop = img[y:y + size_h, x:x + size_w, :]
     new_labels = copy.deepcopy(labels)
@@ -141,40 +147,40 @@ def random_distort_image(img, hue, saturation, exposure):
     return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
 
 class YoloDataset(data.Dataset):
-    def __init__(self, opt, data_dir, mode):
+    def __init__(self, opt):
         super(YoloDataset, self).__init__()
         self.opt = opt
-        self.jitter = self.opt.jitter if mode is 'Train' else 1
-        self.hue = self.opt.hue if mode is 'Train' else 0
-        self.saturation = self.opt.saturation if mode is 'Train' else 1
-        self.exposure = self.opt.exposure if mode is 'Train' else 1
-
-        self.images = self.load_txt(data_dir)
+        self.images = self.load_txt(opt.data_dir)
         self.data_size = len(self.images)
         self.img_size = opt.img_size
-        self.mode = mode
+        self.mode = opt.mode
         self.batch_count = 0
         self.no_letter = opt.no_letter
-        self.mosaic = opt.mosaic
+        self.mosaic = opt.mosaic if opt.mode == "Train" else False
+        self.jitter = 0.3 if opt.mode == "Train" else 0
+        self.hue = 1 if opt.mode == "Train" else 0
+        self.saturation = 1.5 if opt.mode == "Train" else 1
+        self.exposure = 3 if opt.mode == "Train" else 1
 
     def load_txt(self, file_path):
-        f_data = open(file_path, 'r', encoding='utf-8')
+        f_data = open(file_path, "r", encoding="utf-8")
         lines = f_data.readlines()
         data = {}
-        for idx, line in tqdm(lines, desc='Data loader'):
-            line = line.encode('utf8').strip()
-            img_path = line.split(' '.encode('utf8'))[0].decode()
-            label_path = os.path.splitext(img_path)[0].replace('images', 'labels') + '.txt'
-            data[idx] = {'img_path': img_path, 'labels': label_path}
+        
+        for idx, line in tqdm(enumerate(lines), desc="Data loader"):
+            line = line.encode("utf8").strip()
+            img_path = line.split(" ".encode("utf8"))[0].decode()
+            label_path = os.path.splitext(img_path)[0].replace("data0/zhenglei/data_public_cooperative_vehicle_infrastructure", "data/zhengdong/Detection") + ".txt"
+            data[idx] = {"img_path": img_path, "labels": label_path}
         
         print(f"Datafile {file_path} has {len(data)}!")
         return data
 
     def load_data(self, index):
-        return cv2.cvtColor(cv2.imread(self.images[index]['img_path'], cv2.COLOR_BGR2RGB))
+        return cv2.cvtColor(cv2.imread(self.images[index]["img_path"]), cv2.COLOR_BGR2RGB)
         
     def load_labels(self, index):
-        label_path = self.images[index]['labels']
+        label_path = self.images[index]["labels"]
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             boxes = np.loadtxt(label_path).reshape(-1, 5)                
@@ -232,12 +238,11 @@ class YoloDataset(data.Dataset):
 
     def letter_box(self, img, bboxes_xyxy):
         w_o, h_o = img.shape[1], img.shape[0]
-        w, h = self.img_size, self.img_size
+        w, h = self.img_size
         sized = np.full((w, h, 3), 127.5)
         dw = self.jitter * w_o
         dh = self.jitter * h_o
-        new_ar = (w_o + random.uniform(-dw, dw)) / (h_o + random.uniform(-dh, dh)) \
-            if self.mode is 'Train' else w_o / h_o
+        new_ar = (w_o + random.uniform(-dw, dw)) / (h_o + random.uniform(-dh, dh)) if self.mode == "Train" else w_o / h_o
         
         if new_ar < 1:
             nh = h
@@ -246,15 +251,15 @@ class YoloDataset(data.Dataset):
             nw = w
             nh = nw / new_ar
             
-        dx = random.uniform(-(w - nw) / 2, (w - nw) / 2) if self.mode is 'Train' else 0
-        dy = random.uniform(-(h - nh) / 2, (h - nh) / 2) if self.mode is 'Train' else 0
-
+        dx = random.uniform(-(w - nw) / 2, (w - nw) / 2) if self.mode == "Train" else 0
+        dy = random.uniform(-(h - nh) / 2, (h - nh) / 2) if self.mode == "Train" else 0
         resized = cv2.resize(img, (int(nw), int(nh)), interpolation=cv2.INTER_CUBIC)
+
         lx = int((w - nw) // 2 + dx)
         ly = int((h - nh) // 2 + dy)
         rx = int(nw) + lx
         ry = int(nh) + ly
-
+        
         sized[ly:ry, lx:rx, :] = resized
         bboxes_xyxy[..., 0] = (bboxes_xyxy[..., 0] * nw + (w - nw) / 2 + dx) / w
         bboxes_xyxy[..., 1] = (bboxes_xyxy[..., 1] * nh + (h - nh) / 2 + dy) / h
@@ -263,13 +268,13 @@ class YoloDataset(data.Dataset):
         return sized, bboxes_xyxy
 
     def common_data(self, idx):
-        # Load daa
+        # Load data
         img = self.load_data(idx)
         bboxes = self.load_labels(idx)
         bboxes_xyxy = xywh2xyxy(bboxes[..., 1:])
         # Transform
-        flip = random.uniform(0, 1) if self.mode is 'Train' else 1
-        crop = random.uniform(0, 1) if self.mode is 'Train' else 1
+        flip = random.uniform(0, 1) if self.mode == "Train" else 1
+        crop = random.uniform(0, 1) if self.mode == "Train" else 1
         # Random crop
         if crop < 0.5:
             img, bboxes_xyxy, idx = random_crop(img, bboxes_xyxy)
@@ -278,7 +283,7 @@ class YoloDataset(data.Dataset):
         if not self.no_letter:
             img, bboxes_xyxy = self.letter_box(img , bboxes_xyxy)
         else:
-            img = cv2.resize(img, (int(self.img_size), int(self.img_size)), interpolation=cv2.INTER_CUBIC)
+            img = cv2.resize(img, (int(self.img_size[0]), int(self.img_size[1])), interpolation=cv2.INTER_CUBIC)
         # Colors
         img = random_distort_image(img, self.hue, self.saturation, self.exposure)
         # Flip
@@ -290,15 +295,23 @@ class YoloDataset(data.Dataset):
 
     def collate_fn(self, batch):
         self.batch_count += 1
-        img_path, imgs, bb_targets = list(zip(*batch))
+        imgs, bb_targets, img_path = list(zip(*batch))
         imgs = torch.stack(imgs)
+        max_l = 0
         for i, boxes in enumerate(bb_targets):
+            max_l = max(max_l, len(boxes))
             boxes[:, 0] = i
+        if self.opt.model_type == "Fcos" and self.opt.mode == "Train":
+            fcos_taregts = -torch.ones((len(bb_targets), max_l, 5))
+            for i, boxes in enumerate(bb_targets):
+                fcos_taregts[i, :boxes.shape[0], :4] = boxes[..., 2:]
+                fcos_taregts[i, :boxes.shape[0], 4] = boxes[..., 1] + 1
+            return img_path, imgs, fcos_taregts
         bb_targets = torch.cat(bb_targets, 0)
-        return img_path, imgs, bb_targets
+        return imgs, bb_targets, img_path
 
     def __getitem__(self, index):
-        if self.mosaic and self.mode is 'Train':
+        if self.mosaic and self.mode == "Train":
             # Mosaic
             img, bboxes = self.load_mosaic(index)
             # Mix up
@@ -312,7 +325,7 @@ class YoloDataset(data.Dataset):
         bb_targets = torch.zeros((len(bboxes), 6))
         bb_targets[:, 1:] = transforms.ToTensor()(bboxes)
         img = transforms.ToTensor()(img)
-        return self.images[index]['img_path'], img, bb_targets
+        return img, bb_targets, self.images[index]["img_path"]
     
     def __len__(self):
         return self.data_size
@@ -320,23 +333,15 @@ class YoloDataset(data.Dataset):
 class YoloLoader():
     def __init__(self, opt):
         self.opt = opt
-        if opt.mode is 'Train':
-            print("Load Train Dataset...")
-            self.train_set = YoloDataset(opt, opt.train_dir, 'Train')
-        else:
-            print("Load Test Dataset...")
-            self.train_set = YoloDataset(opt, opt.test_dir, 'Test')
+        print(f"Load {opt.mode} Dataset...")
+        self.data_set = YoloDataset(opt)
     
-    def GetTrainset(self):
-        return self._DataLoader(self.train_set)
-    
-    def GetTestset(self):
-        return self._DataLoader(self.test_set)
+    def GetDataset(self):
+        return self._DataLoader(self.data_set)
 
     def _DataLoader(self, dataset):
-        dataloader = data.DataLoader(dataset, 
-                                    batch_size=self.opt.batch_size,
-                                    shuffle=self.opt.shuffle,
-                                    num_workers=int(self.opt.num_worker),
+        dataloader = data.DataLoader(dataset, batch_size=self.opt.batch_size, 
+                                    shuffle=self.opt.shuffle, 
+                                    num_workers=int(self.opt.load_thread),
                                     collate_fn=dataset.collate_fn)
         return dataloader
